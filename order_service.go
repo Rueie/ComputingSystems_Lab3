@@ -14,11 +14,14 @@ import "github.com/go-redis/redis/v8"
 import "time"
 import "bytes"
 import "strconv"
+import ampq "github.com/rabbitmq/amqp091-go"
 
 // import "reflect"
 
 var ctx = context.Background()
 var client *redis.Client
+var ch *ampq.Channel
+var q ampq.Queue
 
 type OrderProduct struct {
 	Name   string `json:"name"`
@@ -47,9 +50,9 @@ type Mess struct {
 	Info   string `json:"info"`
 }
 
-type Product struct{
-	Name string `json:"name"`
-	Quantity int `json:"quantity"`
+type Product struct {
+	Name     string `json:"name"`
+	Quantity int    `json:"quantity"`
 }
 
 func packageAndSendMess(w http.ResponseWriter, ms Mess) {
@@ -63,6 +66,7 @@ func packageAndSendMess(w http.ResponseWriter, ms Mess) {
 }
 
 func handlerAddOrder(w http.ResponseWriter, r *http.Request) {
+	fmt.Println("Begin creating order")
 	var ms Mess
 	body, err := ioutil.ReadAll(r.Body)
 	if err != nil {
@@ -101,7 +105,7 @@ func handlerAddOrder(w http.ResponseWriter, r *http.Request) {
 	counter := 0
 	for _, prod := range info.List {
 		redisProd := RedisOrderProduct{prod.Name, prod.Number, "in progress"}
-		productForInventory := Product{prod.Name,prod.Number}
+		productForInventory := Product{prod.Name, prod.Number}
 		prodInve, err := json.Marshal(productForInventory)
 		if err != nil {
 			fmt.Println(err)
@@ -111,7 +115,7 @@ func handlerAddOrder(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		rs := bytes.NewReader(prodInve)
-		conn, err := http.Post("http://127.0.0.1:8083/sub_inv","application/json", rs)
+		conn, err := http.Post("http://127.0.0.1:8083/sub_inv", "application/json", rs)
 		if err != nil {
 			fmt.Println(err)
 			ms.Status = "ERROR"
@@ -128,7 +132,7 @@ func handlerAddOrder(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var connMs Mess
-		err = json.Unmarshal(connBody,&connMs)
+		err = json.Unmarshal(connBody, &connMs)
 		if err != nil {
 			fmt.Println(err)
 			ms.Status = "ERROR"
@@ -148,7 +152,7 @@ func handlerAddOrder(w http.ResponseWriter, r *http.Request) {
 		}
 		redisInfo.List = append(redisInfo.List, redisProd)
 	}
-	if counter == len(redisInfo.List){
+	if counter == len(redisInfo.List) {
 		redisInfo.State = "done"
 	}
 	ds, err := json.Marshal(redisInfo)
@@ -167,48 +171,24 @@ func handlerAddOrder(w http.ResponseWriter, r *http.Request) {
 		packageAndSendMess(w, ms)
 		return
 	}
-	ms.Status = "OK"
-	ms.Info = "Был создан заказ <" + uuid.Must(id, err).String() + ">"
-	jsMS, err := json.Marshal(ms)
-	if err != nil {
-		fmt.Println(err)
-		ms.Status = "ERROR"
-		ms.Info = "Ошибка в конвертации запроса в json для микросервиса уведомлений"
-		packageAndSendMess(w, ms)
-		return
-	}
-	rs := bytes.NewReader(jsMS)
-	_, err = http.Post("http://127.0.0.1:8084", "application/json", rs)
-	if err != nil {
-		fmt.Println(err)
-		ms.Status = "ERROR"
-		ms.Info = "Ошибка в отправке сообщения на микросервис уведомлений"
-		packageAndSendMess(w, ms)
-		return
-	}
 	for _, product := range redisInfo.List {
 		if product.State == "done" {
-			ms.Status = "OK"
-			ms.Info = "Зарезервировано <" +strconv.Itoa(product.Number)+ "><" +product.Name+ "> для заказа <" +uuid.Must(id, err).String()+ ">"
-			jsMS, err := json.Marshal(ms)
-			if err != nil {
-				fmt.Println(err)
-				ms.Status = "ERROR"
-				ms.Info = "Ошибка в конвертации запроса в json для микросервиса уведомлений"
-				packageAndSendMess(w, ms)
-				return
-			}
-			rs := bytes.NewReader(jsMS)
-			_, err = http.Post("http://127.0.0.1:8084", "application/json", rs)
-			if err != nil {
-				fmt.Println(err)
-				ms.Status = "ERROR"
-				ms.Info = "Ошибка в отправке сообщения на микросервис уведомлений"
-				packageAndSendMess(w, ms)
-				return
-			}
+			Info := "Зарезервировано <" + strconv.Itoa(product.Number) + "><" + product.Name + "> для заказа <" + uuid.Must(id, err).String() + ">"
+			newctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			err = ch.PublishWithContext(newctx,
+				"",
+				q.Name,
+				false,
+				false,
+				ampq.Publishing{
+					ContentType: "text/plain",
+					Body:        []byte(Info),
+				},
+			)
+			defer cancel()
 		}
 	}
+	fmt.Println("Creating order was successful")
 	ms.Status = "OK"
 	ms.Info = "заказ сформирован"
 	packageAndSendMess(w, ms)
@@ -254,24 +234,24 @@ func handlerGetOrders(w http.ResponseWriter, r *http.Request) {
 	if rec, ok := results.([]interface{}); ok {
 		for _, recc := range rec {
 			if reccc, ok := recc.(string); ok {
-				val, err = client.Get(ctx,reccc).Result()
+				val, err = client.Get(ctx, reccc).Result()
 				if err != nil {
 					fmt.Println(err)
 					ms.Status = "ERROR"
-					ms.Info = "Ошибка в чтении заказа <" +reccc+ ">"
+					ms.Info = "Ошибка в чтении заказа <" + reccc + ">"
 					packageAndSendMess(w, ms)
 					return
 				}
 				var newOrder RedisListOrderProducts
-				err = json.Unmarshal([]byte(val),&newOrder)
+				err = json.Unmarshal([]byte(val), &newOrder)
 				if err != nil {
 					fmt.Println(err)
 					ms.Status = "ERROR"
-					ms.Info = "Ошибка в распаковке содержимого заказа <" +reccc+ ">"
+					ms.Info = "Ошибка в распаковке содержимого заказа <" + reccc + ">"
 					packageAndSendMess(w, ms)
 					return
 				}
-				orderList = append(orderList,newOrder)
+				orderList = append(orderList, newOrder)
 			}
 		}
 	}
@@ -289,8 +269,8 @@ func handlerGetOrders(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	fmt.Println("Ordres server start to work")
-	defer fmt.Println("Orders server stop wroking")
+	fmt.Println("Orders server start to work")
+	defer fmt.Println("Orders server stop working")
 	fmt.Println("Connecting to keyDB server")
 	defer fmt.Println("Close connection to keyDB server")
 	client = redis.NewClient(&redis.Options{
@@ -303,7 +283,41 @@ func main() {
 		fmt.Println(err)
 		return
 	}
-	fmt.Println("Connecting to DB was sacessfull")
+	fmt.Println("Connecting to DB was successful")
+	fmt.Println("Connecting to RabbitMQ")
+	defer fmt.Println("Close connection to RabbitMQ")
+	conn, err := ampq.Dial("amqp://guest:guest@localhost:5672/")
+	if err != nil {
+		fmt.Println("RabbitMQ is not available")
+		fmt.Println(err)
+		return
+	}
+	defer conn.Close()
+	fmt.Println("Connecting to RabbitMQ was successful")
+	fmt.Println("Creating RMQ channel")
+	ch, err = conn.Channel()
+	if err != nil {
+		fmt.Println("Error in creating RMQ channel")
+		fmt.Println(err)
+		return
+	}
+	fmt.Println("Creating RMQ channel was successful")
+	defer ch.Close()
+	fmt.Println("Creating RMQ queue")
+	q, err = ch.QueueDeclare(
+		"Inventory", // name
+		false,       // durable
+		false,       // delete when unused
+		false,       // exclusive
+		false,       // no-wait
+		nil,         // arguments
+	)
+	if err != nil {
+		fmt.Println(err)
+		fmt.Println("Error in creating RMQ queue")
+		return
+	}
+	fmt.Println("Creating RMQ queue was successful")
 	http.HandleFunc("/add_order", handlerAddOrder)
 	http.HandleFunc("/get_orders", handlerGetOrders)
 	go http.ListenAndServe(":8082", nil)
